@@ -21,7 +21,7 @@ export function signAccessToken(payload) {
     throw err;
   }
 
-  const expiresIn = process.env.JWT_EXPIRES_IN || "15m";
+  const expiresIn = process.env.JWT_EXPIRES_IN || "30d";
   return jwt.sign(payload, secret, { expiresIn });
 }
 

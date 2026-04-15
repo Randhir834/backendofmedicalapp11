@@ -58,6 +58,23 @@ const doctorSchema = new mongoose.Schema(
       trim: true,
       index: true,
     },
+    specialty: {
+      type: String,
+      trim: true,
+      index: true,
+      default: "",
+    },
+    consultationFee: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    adminRating: {
+      type: Number,
+      default: null,
+      min: 1,
+      max: 5,
+    },
     qualification: {
       highestDegree: { type: String, required: true, trim: true },
       instituteName: { type: String, required: true, trim: true },
@@ -100,6 +117,7 @@ const doctorSchema = new mongoose.Schema(
       sessionTwoEnabled: { type: Boolean, default: true },
       sessionTwoFrom: { type: String, default: null },
       sessionTwoTo: { type: String, default: null },
+      appointmentDuration: { type: Number, default: 30, min: 5, max: 120 },
     },
     approvalStatus: {
       type: String,

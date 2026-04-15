@@ -22,6 +22,18 @@ function isValidEmail(email) {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
 }
 
+function isLocked(session) {
+  const until = session?.lockedUntil ? new Date(session.lockedUntil).getTime() : null;
+  return until != null && Number.isFinite(until) && until > Date.now();
+}
+
+function lockoutRetryAfterSeconds(session) {
+  const until = session?.lockedUntil ? new Date(session.lockedUntil).getTime() : null;
+  if (until == null || !Number.isFinite(until)) return 0;
+  const ms = until - Date.now();
+  return ms > 0 ? Math.ceil(ms / 1000) : 0;
+}
+
 /**
  * requestOtp (UPDATED)
  * ✔ Respond instantly
@@ -36,6 +48,41 @@ export async function requestOtp(req, res, next) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
 
+    const existingSession = await OtpSession.findOne({ email, verifiedAt: null })
+      .select({ lockedUntil: 1 })
+      .sort({ updatedAt: -1 });
+
+    if (isLocked(existingSession)) {
+      const retryAfterSeconds = lockoutRetryAfterSeconds(existingSession);
+      return res.status(429).json({
+        success: false,
+        message: retryAfterSeconds
+          ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
+          : "Too many failed attempts. Please try again later.",
+        retryAfterSeconds,
+      });
+    }
+
+    const cooldownSeconds = Number.parseInt(process.env.OTP_RESEND_COOLDOWN_SECONDS || "30", 10);
+    const cooldownMs = Math.max(0, cooldownSeconds) * 1000;
+    if (cooldownMs > 0) {
+      const lastSession = await OtpSession.findOne({ email, verifiedAt: null })
+        .select({ updatedAt: 1, createdAt: 1, expiresAt: 1 })
+        .sort({ updatedAt: -1 });
+
+      if (lastSession?.updatedAt) {
+        const elapsedMs = Date.now() - lastSession.updatedAt.getTime();
+        if (elapsedMs >= 0 && elapsedMs < cooldownMs) {
+          const retryAfterSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+          return res.status(429).json({
+            success: false,
+            message: `Please wait ${retryAfterSeconds} seconds before requesting another OTP.`,
+            retryAfterSeconds,
+          });
+        }
+      }
+    }
+
     // Generate OTP and store only a hash in DB.
     const otp = generateOtp();
     const otpHash = hashOtp(otp);
@@ -46,7 +93,7 @@ export async function requestOtp(req, res, next) {
     // Create or update OtpSession with OTP hash and expiration.
     await OtpSession.findOneAndUpdate(
       { email, verifiedAt: null },
-      { $set: { otpHash, expiresAt, verifiedAt: null } },
+      { $set: { otpHash, expiresAt, verifiedAt: null, attemptCount: 0, lockedUntil: null } },
       { upsert: true, new: true }
     );
 
@@ -55,11 +102,17 @@ export async function requestOtp(req, res, next) {
       success: true,
       message: "OTP is being sent",
       email,
+      cooldownSeconds: Number.parseInt(process.env.OTP_RESEND_COOLDOWN_SECONDS || "30", 10),
     });
 
     // ⭐ SEND EMAIL IN BACKGROUND (no waiting)
     sendOtpEmail({ to: email, otp }).catch(err => {
-      console.error("Failed to send OTP email:", err.message);
+      console.error("[OTP Email Failed]", {
+        email,
+        error: err.message,
+        stack: err.stack,
+        timestamp: new Date().toISOString()
+      });
     });
 
   } catch (err) {
@@ -88,6 +141,18 @@ export async function verifyOtp(req, res, next) {
     if (!session) {
       return res.status(400).json({ success: false, message: "OTP not found. Please request a new one." });
     }
+
+    if (isLocked(session)) {
+      const retryAfterSeconds = lockoutRetryAfterSeconds(session);
+      return res.status(429).json({
+        success: false,
+        message: retryAfterSeconds
+          ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
+          : "Too many failed attempts. Please try again later.",
+        retryAfterSeconds,
+      });
+    }
+
     if (session.expiresAt.getTime() < Date.now()) {
       return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
     }
@@ -95,10 +160,34 @@ export async function verifyOtp(req, res, next) {
     // Compare hashed OTP.
     const providedHash = hashOtp(otp);
     if (providedHash !== session.otpHash) {
+      const maxAttempts = Number.parseInt(process.env.OTP_MAX_VERIFY_ATTEMPTS || "5", 10);
+      const lockoutSeconds = Number.parseInt(process.env.OTP_LOCKOUT_SECONDS || "300", 10);
+      const nextAttempt = Number(session.attemptCount || 0) + 1;
+
+      session.attemptCount = nextAttempt;
+      if (Number.isFinite(maxAttempts) && nextAttempt >= Math.max(1, maxAttempts)) {
+        const lockMs = Math.max(0, Number.isFinite(lockoutSeconds) ? lockoutSeconds : 300) * 1000;
+        session.lockedUntil = lockMs > 0 ? new Date(Date.now() + lockMs) : new Date(Date.now() + 5 * 60 * 1000);
+      }
+      await session.save();
+
+      if (isLocked(session)) {
+        const retryAfterSeconds = lockoutRetryAfterSeconds(session);
+        return res.status(429).json({
+          success: false,
+          message: retryAfterSeconds
+            ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
+            : "Too many failed attempts. Please try again later.",
+          retryAfterSeconds,
+        });
+      }
+
       return res.status(400).json({ success: false, message: "Invalid OTP" });
     }
 
     session.verifiedAt = new Date();
+    session.attemptCount = 0;
+    session.lockedUntil = null;
     await session.save();
 
     // Ensure User record exists
@@ -109,7 +198,7 @@ export async function verifyOtp(req, res, next) {
     );
 
     // Bootstrap the admin account if needed
-    const bootstrapAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL || "randhircool44@gmail.com");
+    const bootstrapAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
     if (bootstrapAdminEmail) {
       await Admin.findOneAndUpdate(
         { email: bootstrapAdminEmail },
