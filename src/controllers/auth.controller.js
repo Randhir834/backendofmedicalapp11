@@ -132,44 +132,20 @@ export async function verifyOtp(req, res, next) {
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
-    if (!/^[0-9]{6}$/.test(otp)) {
-      return res.status(400).json({ success: false, message: "Valid 6-digit OTP is required" });
-    }
 
-    // Find the latest unverified OTP session.
-    const session = await OtpSession.findOne({ email, verifiedAt: null }).sort({ createdAt: -1 });
-    if (!session) {
-      return res.status(400).json({ success: false, message: "OTP not found. Please request a new one." });
-    }
-
-    if (isLocked(session)) {
-      const retryAfterSeconds = lockoutRetryAfterSeconds(session);
-      return res.status(429).json({
-        success: false,
-        message: retryAfterSeconds
-          ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
-          : "Too many failed attempts. Please try again later.",
-        retryAfterSeconds,
-      });
-    }
-
-    if (session.expiresAt.getTime() < Date.now()) {
-      return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
-    }
-
-    // Compare hashed OTP.
-    const providedHash = hashOtp(otp);
-    if (providedHash !== session.otpHash) {
-      const maxAttempts = Number.parseInt(process.env.OTP_MAX_VERIFY_ATTEMPTS || "5", 10);
-      const lockoutSeconds = Number.parseInt(process.env.OTP_LOCKOUT_SECONDS || "300", 10);
-      const nextAttempt = Number(session.attemptCount || 0) + 1;
-
-      session.attemptCount = nextAttempt;
-      if (Number.isFinite(maxAttempts) && nextAttempt >= Math.max(1, maxAttempts)) {
-        const lockMs = Math.max(0, Number.isFinite(lockoutSeconds) ? lockoutSeconds : 300) * 1000;
-        session.lockedUntil = lockMs > 0 ? new Date(Date.now() + lockMs) : new Date(Date.now() + 5 * 60 * 1000);
+    // ⭐ SKIP OTP VERIFICATION IF DISABLED
+    const skipOtpVerification = process.env.SKIP_OTP_VERIFICATION === "true";
+    
+    if (!skipOtpVerification) {
+      if (!/^[0-9]{6}$/.test(otp)) {
+        return res.status(400).json({ success: false, message: "Valid 6-digit OTP is required" });
       }
-      await session.save();
+
+      // Find the latest unverified OTP session.
+      const session = await OtpSession.findOne({ email, verifiedAt: null }).sort({ createdAt: -1 });
+      if (!session) {
+        return res.status(400).json({ success: false, message: "OTP not found. Please request a new one." });
+      }
 
       if (isLocked(session)) {
         const retryAfterSeconds = lockoutRetryAfterSeconds(session);
@@ -182,13 +158,43 @@ export async function verifyOtp(req, res, next) {
         });
       }
 
-      return res.status(400).json({ success: false, message: "Invalid OTP" });
-    }
+      if (session.expiresAt.getTime() < Date.now()) {
+        return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
+      }
 
-    session.verifiedAt = new Date();
-    session.attemptCount = 0;
-    session.lockedUntil = null;
-    await session.save();
+      // Compare hashed OTP.
+      const providedHash = hashOtp(otp);
+      if (providedHash !== session.otpHash) {
+        const maxAttempts = Number.parseInt(process.env.OTP_MAX_VERIFY_ATTEMPTS || "5", 10);
+        const lockoutSeconds = Number.parseInt(process.env.OTP_LOCKOUT_SECONDS || "300", 10);
+        const nextAttempt = Number(session.attemptCount || 0) + 1;
+
+        session.attemptCount = nextAttempt;
+        if (Number.isFinite(maxAttempts) && nextAttempt >= Math.max(1, maxAttempts)) {
+          const lockMs = Math.max(0, Number.isFinite(lockoutSeconds) ? lockoutSeconds : 300) * 1000;
+          session.lockedUntil = lockMs > 0 ? new Date(Date.now() + lockMs) : new Date(Date.now() + 5 * 60 * 1000);
+        }
+        await session.save();
+
+        if (isLocked(session)) {
+          const retryAfterSeconds = lockoutRetryAfterSeconds(session);
+          return res.status(429).json({
+            success: false,
+            message: retryAfterSeconds
+              ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
+              : "Too many failed attempts. Please try again later.",
+            retryAfterSeconds,
+          });
+        }
+
+        return res.status(400).json({ success: false, message: "Invalid OTP" });
+      }
+
+      session.verifiedAt = new Date();
+      session.attemptCount = 0;
+      session.lockedUntil = null;
+      await session.save();
+    }
 
     // Ensure User record exists
     const user = await User.findOneAndUpdate(
