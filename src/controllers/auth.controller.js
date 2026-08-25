@@ -242,3 +242,90 @@ export async function verifyOtp(req, res, next) {
     return next(err);
   }
 }
+
+/**
+ * Phone-based login WITHOUT OTP
+ * If phone is registered -> login
+ * If phone is not registered -> return needsRegistration flag
+ */
+export async function phoneLogin(req, res, next) {
+  try {
+    const phone = String(req.body?.phone || "").trim();
+
+    // Validate phone number format (10 digits)
+    if (!phone || !/^[0-9]{10}$/.test(phone)) {
+      return res.status(400).json({ success: false, message: "Valid 10-digit phone number is required" });
+    }
+
+    // Check if phone is registered with any patient or doctor
+    const [patient, doctor] = await Promise.all([
+      Patient.findOne({ phone }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+      Doctor.findOne({ phone }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+    ]);
+
+    // If phone is not registered, ask user if they want to register
+    if (!patient && !doctor) {
+      return res.status(200).json({
+        success: true,
+        needsRegistration: true,
+        phone,
+        message: "Phone number not registered. Would you like to register?",
+      });
+    }
+
+    // Phone is registered - log the user in
+    const profile = patient || doctor;
+    const role = patient ? "patient" : "doctor";
+    
+    // Get or create user record
+    let user;
+    if (profile.userId) {
+      user = await User.findById(profile.userId);
+    }
+    
+    if (!user && profile.email) {
+      user = await User.findOneAndUpdate(
+        { email: normalizeEmail(profile.email) },
+        { $set: { lastLoginAt: new Date() } },
+        { upsert: true, new: true }
+      );
+    }
+
+    if (!user) {
+      // Create user with phone as identifier
+      user = await User.create({
+        email: `${phone}@phone.local`,
+        lastLoginAt: new Date(),
+      });
+      
+      // Update profile with userId
+      if (patient) {
+        await Patient.findByIdAndUpdate(profile._id, { userId: user._id });
+      } else {
+        await Doctor.findByIdAndUpdate(profile._id, { userId: user._id });
+      }
+    } else {
+      // Update last login
+      user.lastLoginAt = new Date();
+      await user.save();
+    }
+
+    // Generate access token
+    const accessToken = signAccessToken({ sub: user._id.toString(), email: user.email });
+
+    return res.status(200).json({
+      success: true,
+      accessToken,
+      isRegistered: true,
+      needsRegistration: false,
+      role,
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+      },
+      phone,
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
