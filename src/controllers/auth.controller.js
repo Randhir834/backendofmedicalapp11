@@ -242,3 +242,89 @@ export async function verifyOtp(req, res, next) {
     return next(err);
   }
 }
+
+/**
+ * Phone-based login WITHOUT OTP
+ * If phone is registered -> login
+ * If phone is not registered -> return needsRegistration flag
+ */
+export async function emailLogin(req, res, next) {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+
+    // Validate email format
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Valid email is required" });
+    }
+
+    // Check if email is registered with any patient or doctor
+    const [patient, doctor] = await Promise.all([
+      Patient.findOne({ email: normalizeEmail(email) }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+      Doctor.findOne({ email: normalizeEmail(email) }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+    ]);
+
+    // If email is not registered, ask user if they want to register
+    if (!patient && !doctor) {
+      return res.status(200).json({
+        success: true,
+        needsRegistration: true,
+        email,
+        message: "Email not registered. Would you like to register?",
+      });
+    }
+
+    // Email is registered - log the user in
+    const profile = patient || doctor;
+    const role = patient ? "patient" : "doctor";
+    
+    // Get or create user record
+    let user;
+    if (profile.userId) {
+      user = await User.findById(profile.userId);
+    }
+    
+    if (!user && profile.email) {
+      user = await User.findOneAndUpdate(
+        { email: normalizeEmail(profile.email) },
+        { $set: { lastLoginAt: new Date() } },
+        { upsert: true, new: true }
+      );
+    }
+
+    if (!user) {
+      // Create user with email as identifier
+      user = await User.create({
+        email: normalizeEmail(email),
+        lastLoginAt: new Date(),
+      });
+      
+      // Update profile with userId
+      if (patient) {
+        await Patient.findByIdAndUpdate(profile._id, { userId: user._id });
+      } else {
+        await Doctor.findByIdAndUpdate(profile._id, { userId: user._id });
+      }
+    } else {
+      // Update last login
+      user.lastLoginAt = new Date();
+      await user.save();
+    }
+
+    // Generate access token
+    const accessToken = signAccessToken({ sub: user._id.toString(), email: user.email });
+
+    return res.status(200).json({
+      success: true,
+      accessToken,
+      isRegistered: true,
+      needsRegistration: false,
+      role,
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
