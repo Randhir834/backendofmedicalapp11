@@ -263,13 +263,32 @@ export async function emailLogin(req, res, next) {
       Doctor.findOne({ email: normalizeEmail(email) }).select({ _id: 1, userId: 1, email: 1 }).lean(),
     ]);
 
-    // If email is not registered, ask user if they want to register
+    // If email is not registered, create a temporary user and token for registration
     if (!patient && !doctor) {
+      // Create temporary user record for registration flow
+      const tempUser = await User.create({
+        email: normalizeEmail(email),
+        createdAt: new Date(),
+      });
+
+      // Generate access token for registration
+      const accessToken = signAccessToken({ 
+        sub: tempUser._id.toString(), 
+        email: tempUser.email,
+        isNewUser: true 
+      });
+
       return res.status(200).json({
         success: true,
         needsRegistration: true,
+        isRegistered: false,
         email,
-        message: "Email not registered. Would you like to register?",
+        accessToken, // Token so user can register
+        user: {
+          id: tempUser._id.toString(),
+          email: tempUser.email,
+        },
+        message: "Email not registered. Please complete registration.",
       });
     }
 
