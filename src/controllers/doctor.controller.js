@@ -713,6 +713,12 @@ function isValidTimeHHmm(value) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
+    // Ensure user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(401).json({ success: false, message: "User not found. Please login again." });
+    }
+
     const email = normalizeEmail(req.body?.email) || tokenEmail;
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });

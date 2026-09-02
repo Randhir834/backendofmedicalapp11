@@ -64,6 +64,12 @@ export async function registerPatient(req, res, next) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
+    // Ensure user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(401).json({ success: false, message: "User not found. Please login again." });
+    }
+
     // Read and validate request body.
     const fullName = String(req.body?.fullName || "").trim();
     const phone = String(req.body?.phone || "").trim();

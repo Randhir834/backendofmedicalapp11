@@ -332,17 +332,18 @@ export async function emailLogin(req, res, next) {
     // Generate access token
     const accessToken = signAccessToken({ sub: user._id.toString(), email: user.email });
 
-    return res.status(200).json({
-      success: true,
-      accessToken,
-      isRegistered: true,
-      needsRegistration: false,
-      role,
-      user: {
-        id: user._id.toString(),
-        email: user.email,
-      },
-    });
+      return res.status(200).json({
+        success: true,
+        accessToken,
+        isRegistered: true,
+        needsRegistration: false,
+        role,
+        email: normalizeEmail(profile.email),
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+        },
+      });
   } catch (err) {
     return next(err);
   }
