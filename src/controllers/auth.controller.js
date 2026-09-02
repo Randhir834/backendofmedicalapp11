@@ -248,32 +248,32 @@ export async function verifyOtp(req, res, next) {
  * If phone is registered -> login
  * If phone is not registered -> return needsRegistration flag
  */
-export async function phoneLogin(req, res, next) {
+export async function emailLogin(req, res, next) {
   try {
-    const phone = String(req.body?.phone || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
 
-    // Validate phone number format (10 digits)
-    if (!phone || !/^[0-9]{10}$/.test(phone)) {
-      return res.status(400).json({ success: false, message: "Valid 10-digit phone number is required" });
+    // Validate email format
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "Valid email is required" });
     }
 
-    // Check if phone is registered with any patient or doctor
+    // Check if email is registered with any patient or doctor
     const [patient, doctor] = await Promise.all([
-      Patient.findOne({ phone }).select({ _id: 1, userId: 1, email: 1 }).lean(),
-      Doctor.findOne({ phone }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+      Patient.findOne({ email: normalizeEmail(email) }).select({ _id: 1, userId: 1, email: 1 }).lean(),
+      Doctor.findOne({ email: normalizeEmail(email) }).select({ _id: 1, userId: 1, email: 1 }).lean(),
     ]);
 
-    // If phone is not registered, ask user if they want to register
+    // If email is not registered, ask user if they want to register
     if (!patient && !doctor) {
       return res.status(200).json({
         success: true,
         needsRegistration: true,
-        phone,
-        message: "Phone number not registered. Would you like to register?",
+        email,
+        message: "Email not registered. Would you like to register?",
       });
     }
 
-    // Phone is registered - log the user in
+    // Email is registered - log the user in
     const profile = patient || doctor;
     const role = patient ? "patient" : "doctor";
     
@@ -292,9 +292,9 @@ export async function phoneLogin(req, res, next) {
     }
 
     if (!user) {
-      // Create user with phone as identifier
+      // Create user with email as identifier
       user = await User.create({
-        email: `${phone}@phone.local`,
+        email: normalizeEmail(email),
         lastLoginAt: new Date(),
       });
       
@@ -323,7 +323,6 @@ export async function phoneLogin(req, res, next) {
         id: user._id.toString(),
         email: user.email,
       },
-      phone,
     });
   } catch (err) {
     return next(err);

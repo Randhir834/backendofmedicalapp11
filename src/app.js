@@ -40,8 +40,9 @@ app.use(
   cors({
     origin(origin, cb) {
       const isProd = process.env.NODE_ENV === "production";
+      // In development, allow all origins
+      if (!isProd) return cb(null, true);
       if (!origin) return cb(null, true);
-      if (!isProd && corsOrigins.length === 0) return cb(null, true);
       if (corsOrigins.includes(origin)) return cb(null, true);
       return cb(Object.assign(new Error("Not allowed by CORS"), { statusCode: 403 }));
     },

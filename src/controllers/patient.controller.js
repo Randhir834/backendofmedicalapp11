@@ -173,7 +173,6 @@ export async function getMyPatientProfile(req, res, next) {
         id: patient._id.toString(),
         userId: patient.userId.toString(),
         fullName: patient.fullName,
-        phone: patient.phone,
         email: patient.email,
         dob: patient.dob,
         gender: patient.gender,
