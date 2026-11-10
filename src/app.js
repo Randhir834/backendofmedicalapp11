@@ -44,6 +44,9 @@ app.use(
       if (!isProd) return cb(null, true);
       if (!origin) return cb(null, true);
       if (corsOrigins.includes(origin)) return cb(null, true);
+      // `flutter run -d chrome` serves the web app on a random localhost port.
+      // Auth uses bearer tokens (no cookies), so allowing local origins is safe.
+      if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return cb(null, true);
       return cb(Object.assign(new Error("Not allowed by CORS"), { statusCode: 403 }));
     },
   })
