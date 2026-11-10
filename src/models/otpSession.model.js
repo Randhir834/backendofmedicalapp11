@@ -31,6 +31,10 @@
        type: Date,
        required: true,
      },
+     lastSentAt: {
+       type: Date,
+       default: null,
+     },
      verifiedAt: {
        type: Date,
        default: null,

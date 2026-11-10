@@ -5,28 +5,47 @@
  */
 import { createTransporter } from "../config/mail.js";
 
-async function sendViaResend({ from, to, subject, text, html }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    const err = new Error("Email configuration missing: RESEND_API_KEY");
-    err.statusCode = 500;
-    throw err;
-  }
+const SENDER_NAME = "TPEx Healthcare";
 
-  const resp = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from,
-      to: [to],
-      subject,
-      text,
-      ...(html ? { html } : {}),
-    }),
-  });
+function env(name) {
+  return String(process.env[name] || "").trim();
+}
+
+function withSenderName(address) {
+  // Leave "Name <addr>" values untouched; wrap bare addresses with the app name.
+  return address.includes("<") ? address : `${SENDER_NAME} <${address}>`;
+}
+
+function isSmtpConfigured() {
+  return Boolean((env("EMAIL_SERVICE") || env("EMAIL_HOST")) && env("EMAIL_USER") && env("EMAIL_PASS"));
+}
+
+async function sendViaResend({ to, subject, text, html }) {
+  const apiKey = env("RESEND_API_KEY");
+  const from = withSenderName(env("RESEND_FROM") || env("EMAIL_FROM") || "onboarding@resend.dev");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  let resp;
+  try {
+    resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from,
+        to: [to],
+        subject,
+        text,
+        ...(html ? { html } : {}),
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
@@ -36,15 +55,10 @@ async function sendViaResend({ from, to, subject, text, html }) {
   }
 }
 
-export async function sendEmail({ to, subject, text, html }) {
-  const from = process.env.EMAIL_FROM || process.env.EMAIL_USER;
-
-  if (process.env.RESEND_API_KEY) {
-    await sendViaResend({ from, to, subject, text, html });
-    return;
-  }
-
+async function sendViaSmtp({ to, subject, text, html }) {
   const transporter = createTransporter();
+  // Gmail and most SMTP providers only allow sending as the authenticated account.
+  const from = withSenderName(env("SMTP_FROM") || env("EMAIL_USER"));
   await transporter.sendMail({
     from,
     to,
@@ -52,6 +66,49 @@ export async function sendEmail({ to, subject, text, html }) {
     text,
     ...(html ? { html } : {}),
   });
+}
+
+/**
+ * sendEmail.
+ *
+ * Provider order:
+ *  1. Resend (if RESEND_API_KEY is set)
+ *  2. SMTP (EMAIL_SERVICE/EMAIL_HOST + EMAIL_USER/EMAIL_PASS) — used directly when
+ *     Resend is not configured, or as a fallback when Resend rejects the message
+ *     (e.g. recipient not allowed because no domain is verified in Resend).
+ *
+ * Throws if every configured provider fails.
+ */
+export async function sendEmail({ to, subject, text, html }) {
+  const hasResend = Boolean(env("RESEND_API_KEY"));
+  const hasSmtp = isSmtpConfigured();
+
+  if (!hasResend && !hasSmtp) {
+    const err = new Error("Email configuration missing: set RESEND_API_KEY or EMAIL_SERVICE/EMAIL_USER/EMAIL_PASS");
+    err.statusCode = 500;
+    throw err;
+  }
+
+  if (hasResend) {
+    try {
+      await sendViaResend({ to, subject, text, html });
+      return { provider: "resend" };
+    } catch (resendErr) {
+      if (!hasSmtp) throw resendErr;
+      console.warn("[Email] Resend failed, falling back to SMTP:", resendErr.message);
+      try {
+        await sendViaSmtp({ to, subject, text, html });
+        return { provider: "smtp" };
+      } catch (smtpErr) {
+        const err = new Error(`All email providers failed. Resend: ${resendErr.message} | SMTP: ${smtpErr.message}`);
+        err.statusCode = 502;
+        throw err;
+      }
+    }
+  }
+
+  await sendViaSmtp({ to, subject, text, html });
+  return { provider: "smtp" };
 }
 
 /**
@@ -130,7 +187,7 @@ export async function sendOtpEmail({ to, otp }) {
     </table>
   `.trim();
 
-  await sendEmail({ to, subject, text, html });
+  return sendEmail({ to, subject, text, html });
 }
 
 export async function sendAppointmentConfirmationEmail({

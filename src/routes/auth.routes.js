@@ -9,10 +9,11 @@
  // auth.routes.js
  //
  // Authentication routes.
- // This backend uses email-based login flow:
- // - POST /auth/login -> request OTP for an email (legacy)
- // - POST /auth/verify-otp -> verify OTP and create a session/token (legacy)
- // - POST /auth/email-login -> email-based login WITHOUT OTP
+ // Email OTP login flow:
+ // - POST /auth/login      -> generate + email a 6-digit OTP
+ // - POST /auth/verify-otp -> verify OTP and issue an access token
+ // - POST /auth/email-login -> legacy login WITHOUT OTP; returns 410 unless
+ //                             ALLOW_EMAIL_LOGIN_WITHOUT_OTP=true
 
  const router = Router();
 

@@ -8,7 +8,7 @@ import Patient from "../models/patient.model.js";
 import Doctor from "../models/doctor.model.js";
 import Admin from "../models/admin.model.js";
 import OtpSession from "../models/otpSession.model.js";
-import { generateOtp, hashOtp } from "../utils/otp.util.js";
+import { generateOtp, hashOtp, otpMatches } from "../utils/otp.util.js";
 import { sendOtpEmail } from "../services/email.service.js";
 import { signAccessToken } from "../config/jwt.js";
 
@@ -34,52 +34,58 @@ function lockoutRetryAfterSeconds(session) {
   return ms > 0 ? Math.ceil(ms / 1000) : 0;
 }
 
+function intEnv(name, fallback) {
+  const n = Number.parseInt(String(process.env[name] ?? "").trim(), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function lockedResponse(res, session) {
+  const retryAfterSeconds = lockoutRetryAfterSeconds(session);
+  return res.status(429).json({
+    success: false,
+    code: "OTP_LOCKED",
+    message: retryAfterSeconds
+      ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
+      : "Too many failed attempts. Please try again later.",
+    retryAfterSeconds,
+  });
+}
+
 /**
- * requestOtp (UPDATED)
- * ✔ Respond instantly
- * ✔ Send OTP email in background
- * ✔ Prevent timeout issues
+ * requestOtp — POST /auth/login { email }
+ *
+ * Generates a 6-digit OTP, stores only its hash, and emails it. The response is
+ * sent only after the email provider has accepted the message, so the app never
+ * shows "OTP sent" when delivery actually failed.
  */
 export async function requestOtp(req, res, next) {
   try {
-    // Accept email from body and normalize it.
     const email = normalizeEmail(req.body?.email);
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
 
-    const existingSession = await OtpSession.findOne({ email, verifiedAt: null })
-      .select({ lockedUntil: 1 })
-      .sort({ updatedAt: -1 });
+    const existingSession = await OtpSession.findOne({ email, verifiedAt: null }).sort({ updatedAt: -1 });
 
     if (isLocked(existingSession)) {
-      const retryAfterSeconds = lockoutRetryAfterSeconds(existingSession);
-      return res.status(429).json({
-        success: false,
-        message: retryAfterSeconds
-          ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
-          : "Too many failed attempts. Please try again later.",
-        retryAfterSeconds,
-      });
+      return lockedResponse(res, existingSession);
     }
 
-    const cooldownSeconds = Number.parseInt(process.env.OTP_RESEND_COOLDOWN_SECONDS || "30", 10);
-    const cooldownMs = Math.max(0, cooldownSeconds) * 1000;
-    if (cooldownMs > 0) {
-      const lastSession = await OtpSession.findOne({ email, verifiedAt: null })
-        .select({ updatedAt: 1, createdAt: 1, expiresAt: 1 })
-        .sort({ updatedAt: -1 });
-
-      if (lastSession?.updatedAt) {
-        const elapsedMs = Date.now() - lastSession.updatedAt.getTime();
-        if (elapsedMs >= 0 && elapsedMs < cooldownMs) {
-          const retryAfterSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
-          return res.status(429).json({
-            success: false,
-            message: `Please wait ${retryAfterSeconds} seconds before requesting another OTP.`,
-            retryAfterSeconds,
-          });
-        }
+    // Resend cooldown, measured from when the last email was actually sent.
+    const cooldownSeconds = Math.max(0, intEnv("OTP_RESEND_COOLDOWN_SECONDS", 30));
+    const lastSentAt = existingSession?.lastSentAt ? existingSession.lastSentAt.getTime() : null;
+    if (cooldownSeconds > 0 && lastSentAt != null) {
+      const elapsedMs = Date.now() - lastSentAt;
+      const cooldownMs = cooldownSeconds * 1000;
+      if (elapsedMs >= 0 && elapsedMs < cooldownMs) {
+        const retryAfterSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+        return res.status(429).json({
+          success: false,
+          code: "OTP_COOLDOWN",
+          message: `Please wait ${retryAfterSeconds} seconds before requesting another OTP.`,
+          retryAfterSeconds,
+          email,
+        });
       }
     }
 
@@ -87,34 +93,48 @@ export async function requestOtp(req, res, next) {
     const otp = generateOtp();
     const otpHash = hashOtp(otp);
 
-    const expireMinutes = Number.parseInt(process.env.OTP_EXPIRE_MINUTES || "5", 10);
+    const expireMinutes = Math.max(1, intEnv("OTP_EXPIRE_MINUTES", 5));
     const expiresAt = new Date(Date.now() + expireMinutes * 60 * 1000);
 
-    // Create or update OtpSession with OTP hash and expiration.
-    await OtpSession.findOneAndUpdate(
+    const session = await OtpSession.findOneAndUpdate(
       { email, verifiedAt: null },
-      { $set: { otpHash, expiresAt, verifiedAt: null, attemptCount: 0, lockedUntil: null } },
+      {
+        $set: {
+          otpHash,
+          expiresAt,
+          verifiedAt: null,
+          attemptCount: 0,
+          lockedUntil: null,
+          lastSentAt: new Date(),
+        },
+      },
       { upsert: true, new: true }
     );
 
-    // ⭐ IMMEDIATE RESPONSE (fixes timeout)
-    res.status(200).json({
-      success: true,
-      message: "OTP is being sent",
-      email,
-      cooldownSeconds: Number.parseInt(process.env.OTP_RESEND_COOLDOWN_SECONDS || "30", 10),
-    });
-
-    // ⭐ SEND EMAIL IN BACKGROUND (no waiting)
-    sendOtpEmail({ to: email, otp }).catch(err => {
+    try {
+      await sendOtpEmail({ to: email, otp });
+    } catch (err) {
       console.error("[OTP Email Failed]", {
         email,
         error: err.message,
-        stack: err.stack,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
-    });
+      // Remove the unusable session so the user can retry immediately.
+      await OtpSession.deleteOne({ _id: session._id }).catch(() => {});
+      return res.status(502).json({
+        success: false,
+        code: "OTP_SEND_FAILED",
+        message: "We couldn't send the OTP email right now. Please try again in a moment.",
+      });
+    }
 
+    return res.status(200).json({
+      success: true,
+      message: "OTP sent to your email",
+      email,
+      cooldownSeconds,
+      expiresInSeconds: expireMinutes * 60,
+    });
   } catch (err) {
     return next(err);
   }
@@ -133,67 +153,68 @@ export async function verifyOtp(req, res, next) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
 
-    // ⭐ SKIP OTP VERIFICATION IF DISABLED
-    const skipOtpVerification = process.env.SKIP_OTP_VERIFICATION === "true";
-    
+    // Dev-only escape hatch. Never honoured in production.
+    const skipOtpVerification =
+      process.env.NODE_ENV !== "production" && String(process.env.SKIP_OTP_VERIFICATION).trim() === "true";
+
     if (!skipOtpVerification) {
       if (!/^[0-9]{6}$/.test(otp)) {
-        return res.status(400).json({ success: false, message: "Valid 6-digit OTP is required" });
+        return res.status(400).json({ success: false, code: "OTP_FORMAT", message: "Valid 6-digit OTP is required" });
       }
 
       // Find the latest unverified OTP session.
-      const session = await OtpSession.findOne({ email, verifiedAt: null }).sort({ createdAt: -1 });
+      const session = await OtpSession.findOne({ email, verifiedAt: null }).sort({ updatedAt: -1 });
       if (!session) {
-        return res.status(400).json({ success: false, message: "OTP not found. Please request a new one." });
+        return res
+          .status(400)
+          .json({ success: false, code: "OTP_NOT_FOUND", message: "OTP not found. Please request a new one." });
       }
 
       if (isLocked(session)) {
-        const retryAfterSeconds = lockoutRetryAfterSeconds(session);
-        return res.status(429).json({
-          success: false,
-          message: retryAfterSeconds
-            ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
-            : "Too many failed attempts. Please try again later.",
-          retryAfterSeconds,
-        });
+        return lockedResponse(res, session);
       }
 
       if (session.expiresAt.getTime() < Date.now()) {
-        return res.status(400).json({ success: false, message: "OTP expired. Please request a new one." });
+        return res
+          .status(400)
+          .json({ success: false, code: "OTP_EXPIRED", message: "OTP expired. Please request a new one." });
       }
 
-      // Compare hashed OTP.
-      const providedHash = hashOtp(otp);
-      if (providedHash !== session.otpHash) {
-        const maxAttempts = Number.parseInt(process.env.OTP_MAX_VERIFY_ATTEMPTS || "5", 10);
-        const lockoutSeconds = Number.parseInt(process.env.OTP_LOCKOUT_SECONDS || "300", 10);
+      if (!otpMatches(otp, session.otpHash)) {
+        const maxAttempts = Math.max(1, intEnv("OTP_MAX_VERIFY_ATTEMPTS", 5));
+        const lockoutSeconds = Math.max(1, intEnv("OTP_LOCKOUT_SECONDS", 300));
         const nextAttempt = Number(session.attemptCount || 0) + 1;
 
         session.attemptCount = nextAttempt;
-        if (Number.isFinite(maxAttempts) && nextAttempt >= Math.max(1, maxAttempts)) {
-          const lockMs = Math.max(0, Number.isFinite(lockoutSeconds) ? lockoutSeconds : 300) * 1000;
-          session.lockedUntil = lockMs > 0 ? new Date(Date.now() + lockMs) : new Date(Date.now() + 5 * 60 * 1000);
+        if (nextAttempt >= maxAttempts) {
+          session.lockedUntil = new Date(Date.now() + lockoutSeconds * 1000);
         }
         await session.save();
 
         if (isLocked(session)) {
-          const retryAfterSeconds = lockoutRetryAfterSeconds(session);
-          return res.status(429).json({
-            success: false,
-            message: retryAfterSeconds
-              ? `Too many failed attempts. Please try again in ${retryAfterSeconds} seconds.`
-              : "Too many failed attempts. Please try again later.",
-            retryAfterSeconds,
-          });
+          return lockedResponse(res, session);
         }
 
-        return res.status(400).json({ success: false, message: "Invalid OTP" });
+        const attemptsLeft = maxAttempts - nextAttempt;
+        return res.status(400).json({
+          success: false,
+          code: "OTP_INVALID",
+          message: `Invalid OTP. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} left.`,
+          attemptsLeft,
+        });
       }
 
-      session.verifiedAt = new Date();
-      session.attemptCount = 0;
-      session.lockedUntil = null;
-      await session.save();
+      // Mark as used atomically so the same OTP can't be redeemed twice concurrently.
+      const consumed = await OtpSession.findOneAndUpdate(
+        { _id: session._id, verifiedAt: null },
+        { $set: { verifiedAt: new Date(), attemptCount: 0, lockedUntil: null } },
+        { new: true }
+      );
+      if (!consumed) {
+        return res
+          .status(400)
+          .json({ success: false, code: "OTP_NOT_FOUND", message: "OTP already used. Please request a new one." });
+      }
     }
 
     // Ensure User record exists
@@ -249,12 +270,58 @@ export async function verifyOtp(req, res, next) {
  * If phone is not registered -> return needsRegistration flag
  */
 export async function emailLogin(req, res, next) {
+  // This endpoint issues a token for any email with no proof of ownership, so it
+  // is disabled unless explicitly re-enabled. The app uses /auth/login + /auth/verify-otp.
+  if (String(process.env.ALLOW_EMAIL_LOGIN_WITHOUT_OTP).trim() !== "true") {
+    return res.status(410).json({
+      success: false,
+      code: "OTP_REQUIRED",
+      message: "Login now requires an email OTP. Please update the app to the latest version.",
+    });
+  }
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
 
     // Validate email format
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
+    }
+
+    // Check if email is admin first (priority check)
+    const admin = await Admin.findOne({ email: normalizeEmail(email) }).select({ _id: 1, email: 1 }).lean();
+    
+    if (admin) {
+      // Email belongs to an admin
+      // Get or create user record for admin
+      let user = await User.findOne({ email: normalizeEmail(email) });
+      
+      if (!user) {
+        user = await User.create({
+          email: normalizeEmail(email),
+          lastLoginAt: new Date(),
+        });
+      } else {
+        // Update last login
+        user.lastLoginAt = new Date();
+        await user.save();
+      }
+
+      // Generate access token
+      const accessToken = signAccessToken({ sub: user._id.toString(), email: user.email });
+
+      return res.status(200).json({
+        success: true,
+        accessToken,
+        isRegistered: true,
+        needsRegistration: false,
+        role: "admin",
+        email: normalizeEmail(email),
+        user: {
+          id: user._id.toString(),
+          email: user.email,
+        },
+        message: "Admin login successful",
+      });
     }
 
     // Check if email is registered with any patient or doctor

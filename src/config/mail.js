@@ -33,9 +33,9 @@
        user,
        pass,
      },
-     connectionTimeout: 10_000,
-     greetingTimeout: 10_000,
-     socketTimeout: 10_000,
+     connectionTimeout: 15_000,
+     greetingTimeout: 15_000,
+     socketTimeout: 20_000,
    };
 
    if (host) {

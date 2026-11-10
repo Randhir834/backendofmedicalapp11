@@ -34,3 +34,12 @@
   }
   return crypto.createHash("sha256").update(`${otp}.${secret}`).digest("hex");
  }
+
+ /**
+  * otpMatches — constant-time comparison of a submitted OTP against a stored hash.
+  */
+ export function otpMatches(otp, storedHash) {
+  const a = Buffer.from(hashOtp(otp), "hex");
+  const b = Buffer.from(String(storedHash || ""), "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+ }
