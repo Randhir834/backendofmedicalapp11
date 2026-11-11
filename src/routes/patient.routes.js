@@ -14,7 +14,7 @@ import { getMyPatientProfile, registerPatient, updateMyPatientProfile } from "..
 // on the currently logged-in user.
 const router = Router();
 
-// Register a new patient
+// Register a new patient (requires the token from OTP verification)
 router.post("/register", authMiddleware, registerPatient);
 // Get the currently logged-in patient's profile
 router.get("/me", authMiddleware, getMyPatientProfile);

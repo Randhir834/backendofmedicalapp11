@@ -706,29 +706,32 @@ function isValidTimeHHmm(value) {
       fileFields: req.files ? Object.keys(req.files) : [],
     });
 
-    const userId = req.user?.sub;
+    // Identity comes from the token issued after OTP verification.
     const tokenEmail = normalizeEmail(req.user?.email);
-
-    if (!userId || !tokenEmail) {
+    if (!req.user?.sub || !tokenEmail) {
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
-
-    // Ensure user exists
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(401).json({ success: false, message: "User not found. Please login again." });
-    }
-
     const email = normalizeEmail(req.body?.email) || tokenEmail;
+
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
     if (email !== tokenEmail) {
-      return res.status(400).json({
-        success: false,
-        message: "Email must match the verified login email",
+      return res.status(400).json({ success: false, message: "Email must match the verified login email" });
+    }
+
+    console.log('[doctor.register] Starting registration for email:', email);
+
+    // The account that verified the OTP (created by /auth/verify-otp).
+    let user = (await User.findById(req.user.sub)) || (await User.findOne({ email }));
+    if (!user) {
+      user = await User.create({
+        email,
+        createdAt: new Date(),
       });
     }
+    // Used below for duplicate checks and GridFS metadata.
+    const userId = user._id;
 
     const fullName = String(req.body?.fullName || "").trim();
     const phone = String(req.body?.phone || "").trim();
@@ -920,17 +923,17 @@ function isValidTimeHHmm(value) {
     uploadedFileIds.push(registrationCertificateId);
 
     console.log("[doctor.register] files uploaded", {
-      userId: String(userId),
+      userId: String(user._id),
       uploadedCount: uploadedFileIds.length,
     });
 
     const doctor = await Doctor.findOneAndUpdate(
-      { userId },
+      { userId: user._id },
       {
         $set: {
           fullName,
           phone,
-          email: tokenEmail,
+          email: email,
           specialty,
           approvalStatus: "pending",
           approvedAt: null,

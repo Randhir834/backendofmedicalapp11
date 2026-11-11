@@ -11,6 +11,7 @@ import OtpSession from "../models/otpSession.model.js";
 import { generateOtp, hashOtp, otpMatches } from "../utils/otp.util.js";
 import { sendOtpEmail } from "../services/email.service.js";
 import { signAccessToken } from "../config/jwt.js";
+import { isTempOtpEnabled, TEMP_STATIC_OTP } from "../config/tempOtp.js";
 
 // Normalize email to lowercase
 function normalizeEmail(email) {
@@ -39,6 +40,28 @@ function intEnv(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// Create the bootstrap admin (ADMIN_EMAIL) if it doesn't exist yet.
+async function ensureBootstrapAdmin() {
+  const bootstrapAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
+  if (!bootstrapAdminEmail) return;
+  await Admin.findOneAndUpdate(
+    { email: bootstrapAdminEmail },
+    { $setOnInsert: { email: bootstrapAdminEmail, createdByEmail: bootstrapAdminEmail } },
+    { upsert: true, new: true }
+  );
+}
+
+// Resolve the user's role from the database. Precedence: admin > patient > doctor.
+// Returns null when the email isn't registered under any role.
+async function findRegisteredRole(email) {
+  const [admin, patient, doctor] = await Promise.all([
+    Admin.findOne({ email }).select({ _id: 1 }).lean(),
+    Patient.findOne({ email }).select({ _id: 1 }).lean(),
+    Doctor.findOne({ email }).select({ _id: 1 }).lean(),
+  ]);
+  return admin ? "admin" : patient ? "patient" : doctor ? "doctor" : null;
+}
+
 function lockedResponse(res, session) {
   const retryAfterSeconds = lockoutRetryAfterSeconds(session);
   return res.status(429).json({
@@ -63,6 +86,23 @@ export async function requestOtp(req, res, next) {
     const email = normalizeEmail(req.body?.email);
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
+    }
+
+    // TEMPORARY: static OTP mode — no OTP is generated or emailed.
+    if (isTempOtpEnabled()) {
+      // New (unregistered) emails are allowed too: after verification the app
+      // sends them to the Patient / Doctor role selection.
+      await ensureBootstrapAdmin();
+      const role = await findRegisteredRole(email);
+      return res.status(200).json({
+        success: true,
+        message: "Enter the temporary login code to continue",
+        email,
+        tempOtpMode: true,
+        tempOtp: TEMP_STATIC_OTP,
+        isRegistered: Boolean(role),
+        cooldownSeconds: 0,
+      });
     }
 
     const existingSession = await OtpSession.findOne({ email, verifiedAt: null }).sort({ updatedAt: -1 });
@@ -157,7 +197,15 @@ export async function verifyOtp(req, res, next) {
     const skipOtpVerification =
       process.env.NODE_ENV !== "production" && String(process.env.SKIP_OTP_VERIFICATION).trim() === "true";
 
-    if (!skipOtpVerification) {
+    const tempOtpMode = isTempOtpEnabled();
+
+    if (tempOtpMode) {
+      // TEMPORARY: accept the fixed code. Unregistered emails continue to role
+      // selection (isRegistered: false), exactly like the real OTP flow.
+      if (otp !== TEMP_STATIC_OTP) {
+        return res.status(400).json({ success: false, code: "OTP_INVALID", message: "Invalid OTP." });
+      }
+    } else if (!skipOtpVerification) {
       if (!/^[0-9]{6}$/.test(otp)) {
         return res.status(400).json({ success: false, code: "OTP_FORMAT", message: "Valid 6-digit OTP is required" });
       }
@@ -225,25 +273,10 @@ export async function verifyOtp(req, res, next) {
     );
 
     // Bootstrap the admin account if needed
-    const bootstrapAdminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
-    if (bootstrapAdminEmail) {
-      await Admin.findOneAndUpdate(
-        { email: bootstrapAdminEmail },
-        { $setOnInsert: { email: bootstrapAdminEmail, createdByEmail: bootstrapAdminEmail } },
-        { upsert: true, new: true }
-      );
-    }
+    await ensureBootstrapAdmin();
 
-    const [patient, doctor] = await Promise.all([
-      Patient.findOne({ email }).select({ _id: 1 }).lean(),
-      Doctor.findOne({ email }).select({ _id: 1 }).lean(),
-    ]);
-
-    const admin = await Admin.findOne({ email }).select({ _id: 1 }).lean();
-    const isAdmin = Boolean(admin);
-
-    // Determine role
-    const role = isAdmin ? "admin" : patient ? "patient" : doctor ? "doctor" : null;
+    // Determine role from the database (admin > patient > doctor)
+    const role = await findRegisteredRole(email);
     const isRegistered = Boolean(role);
 
     // Generate access token

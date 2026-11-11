@@ -279,6 +279,49 @@ function dayRange(dateTime) {
   return { start, end };
 }
 
+function parseTzOffsetMinutes(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const n = Number(value);
+  // Real-world offsets are within -12:00 .. +14:00.
+  if (!Number.isFinite(n) || n < -720 || n > 840) return null;
+  return Math.round(n);
+}
+
+// Resolve the exact moment of a booked slot.
+//
+// Preferred: the app sends the calendar date it showed the user (`date`,
+// YYYY-MM-DD) plus its UTC offset in minutes (`tzOffsetMinutes`, e.g. 330 for
+// IST). The slot is then computed in the patient's time zone, so the stored
+// time is correct whatever time zone the server runs in.
+//
+// Fallback (older app builds): combine `dateTime` with the slot in the
+// server's local time zone, as before.
+function resolveSlotMoment({ dateTime, date, timeSlot, tzOffsetMinutes }) {
+  const t = parseTimeSlotToTimeOfDay(timeSlot);
+  if (!t) return null;
+  const offset = parseTzOffsetMinutes(tzOffsetMinutes);
+  const key = String(date || "").trim();
+
+  if (offset != null && isValidDateKey(key)) {
+    const [y, m, d] = key.split("-").map(Number);
+    const dayStartUtc = Date.UTC(y, m - 1, d) - offset * 60 * 1000;
+    const start = new Date(dayStartUtc + (t.hour * 60 + t.minute) * 60 * 1000);
+    return {
+      start,
+      dateKey: key,
+      dayStart: new Date(dayStartUtc),
+      dayEnd: new Date(dayStartUtc + 24 * 60 * 60 * 1000),
+    };
+  }
+
+  const parsed = parseDateTime(dateTime);
+  if (!parsed) return null;
+  const start = combineDateAndTimeSlot(parsed, timeSlot);
+  if (!start) return null;
+  const { start: dayStart, end: dayEnd } = dayRange(parsed);
+  return { start, dateKey: toDateKey(parsed), dayStart, dayEnd };
+}
+
 function pickNextSlotBookingNumber(existingRows) {
   const used = new Set(
     (existingRows || [])
@@ -352,7 +395,7 @@ export async function createAppointment(req, res, next) {
     if (!isValidObjectId(doctorId)) {
       return res.status(400).json({ success: false, message: "Valid doctorId is required" });
     }
-    if (!dateTimeParsed) {
+    if (!dateTimeParsed && !isValidDateKey(req.body?.date)) {
       return res.status(400).json({ success: false, message: "Valid dateTime is required" });
     }
     if (!timeSlot) {
@@ -360,7 +403,7 @@ export async function createAppointment(req, res, next) {
     }
 
     const doctor = await Doctor.findById(doctorId)
-      .select("userId fullName qualification clinicAddress experience timing approvalStatus isOnline consultationFee")
+      .select("userId fullName qualification clinicAddress experience timing approvalStatus isOnline consultationFee specialty")
       .lean();
     if (!doctor || doctor.approvalStatus !== "approved") {
       return res.status(404).json({ success: false, message: "Doctor not found" });
@@ -391,10 +434,16 @@ export async function createAppointment(req, res, next) {
       return res.status(400).json({ success: false, message: "Selected timeSlot is not available for this doctor" });
     }
 
-    const appointmentStart = combineDateAndTimeSlot(dateTimeParsed, timeSlot);
-    if (!appointmentStart) {
+    const slotMoment = resolveSlotMoment({
+      dateTime: req.body?.dateTime,
+      date: req.body?.date,
+      timeSlot,
+      tzOffsetMinutes: req.body?.tzOffsetMinutes,
+    });
+    if (!slotMoment) {
       return res.status(400).json({ success: false, message: "Invalid timeSlot" });
     }
+    const appointmentStart = slotMoment.start;
 
     const now = new Date();
     const diffMs = appointmentStart.getTime() - now.getTime();
@@ -407,8 +456,7 @@ export async function createAppointment(req, res, next) {
         .json({ success: false, message: "Appointments must be booked at least 2 hours in advance" });
     }
 
-    const { start, end } = dayRange(dateTimeParsed);
-    const dateKey = toDateKey(dateTimeParsed);
+    const { dayStart: start, dayEnd: end, dateKey } = slotMoment;
 
     // Enforce per-doctor, per-day booking limits:
     // - Self bookings: max 1/day
@@ -449,7 +497,7 @@ export async function createAppointment(req, res, next) {
       patientId: patient._id,
       doctorId,
       dateKey,
-      dateTime: dateTimeParsed,
+      dateTime: appointmentStart,
       timeSlot,
       slotBookingNumber: 1,
       consultationType,
@@ -600,9 +648,11 @@ export async function getAvailableSlots(req, res, next) {
 
     // Prefer matching by dateKey (stable), but also fallback to a UTC range so
     // older records without dateKey still block the correct slots.
-    const start = new Date(`${dateKey}T00:00:00.000Z`);
-    const end = new Date(`${dateKey}T00:00:00.000Z`);
-    end.setUTCDate(end.getUTCDate() + 1);
+    // Day boundaries in the patient's time zone when the app sends it.
+    const tzOffsetMinutes = parseTzOffsetMinutes(req.query?.tzOffsetMinutes);
+    const offsetMs = (tzOffsetMinutes ?? 0) * 60 * 1000;
+    const start = new Date(new Date(`${dateKey}T00:00:00.000Z`).getTime() - offsetMs);
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
 
     const booked = await Appointment.find({
       doctorId,
@@ -623,7 +673,11 @@ export async function getAvailableSlots(req, res, next) {
     const slots = allSlots
       .filter((s) => !bookedSet.has(s))
       .filter((s) => {
-        const start = combineDateAndTimeSlot(dayStartLocal, s);
+        const moment =
+          tzOffsetMinutes != null
+            ? resolveSlotMoment({ date: dateKey, timeSlot: s, tzOffsetMinutes })
+            : { start: combineDateAndTimeSlot(dayStartLocal, s) };
+        const start = moment?.start;
         if (!start) return false;
         const diffMs = start.getTime() - now.getTime();
         return diffMs >= 2 * 60 * 60 * 1000;
@@ -1161,15 +1215,24 @@ export async function rescheduleMyAppointment(req, res, next) {
       return res.status(400).json({ success: false, message: "Valid appointment id is required" });
     }
 
-    const newDateTimeParsed = parseDateTime(req.body?.dateTime);
     const newTimeSlot = String(req.body?.timeSlot || "").trim();
-
-    if (!newDateTimeParsed) {
-      return res.status(400).json({ success: false, message: "Valid dateTime is required" });
-    }
     if (!newTimeSlot) {
       return res.status(400).json({ success: false, message: "timeSlot is required" });
     }
+    if (!parseDateTime(req.body?.dateTime) && !isValidDateKey(req.body?.date)) {
+      return res.status(400).json({ success: false, message: "Valid dateTime is required" });
+    }
+
+    const newSlotMoment = resolveSlotMoment({
+      dateTime: req.body?.dateTime,
+      date: req.body?.date,
+      timeSlot: newTimeSlot,
+      tzOffsetMinutes: req.body?.tzOffsetMinutes,
+    });
+    if (!newSlotMoment) {
+      return res.status(400).json({ success: false, message: "Invalid timeSlot" });
+    }
+    const newDateTimeParsed = newSlotMoment.start;
 
     const now = new Date();
     if (newDateTimeParsed <= now) {
@@ -1220,8 +1283,7 @@ export async function rescheduleMyAppointment(req, res, next) {
       return res.status(400).json({ success: false, message: "Selected timeSlot is not available for this doctor" });
     }
 
-    const { start, end } = dayRange(newDateTimeParsed);
-    const dateKey = toDateKey(newDateTimeParsed);
+    const { dayStart: start, dayEnd: end, dateKey } = newSlotMoment;
 
     const alreadyBooked = await Appointment.exists({
       _id: { $ne: appointment._id },

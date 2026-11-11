@@ -4,6 +4,7 @@
  * Auto-generated documentation comments.
  */
  import Patient from "../models/patient.model.js";
+ import User from "../models/user.model.js";
 
  // patient.controller.js
  //
@@ -52,60 +53,44 @@ function parseDob(dob) {
 }
 
 // Register patient endpoint.
-// Creates or updates patient profile for the logged-in user.
-// Validates token identity, full name, phone, email, gender, date of birth, and current location.
+// Creates patient profile with the provided data.
+// Simple: email + data → save to MongoDB
 export async function registerPatient(req, res, next) {
   try {
-    // Validate token identity.
-    const userId = req.user?.sub;
-    const tokenEmail = normalizeEmail(req.user?.email);
-
-    if (!userId || !tokenEmail) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
-    }
-
-    // Ensure user exists
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(401).json({ success: false, message: "User not found. Please login again." });
-    }
+    console.log('[registerPatient] Registration request received:', Object.keys(req.body));
 
     // Read and validate request body.
     const fullName = String(req.body?.fullName || "").trim();
     const phone = String(req.body?.phone || "").trim();
-    const email = normalizeEmail(req.body?.email);
+    const tokenEmail = normalizeEmail(req.user?.email);
+    if (!req.user?.sub || !tokenEmail) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const email = normalizeEmail(req.body?.email) || tokenEmail;
     const gender = String(req.body?.gender || "").trim();
     const dobParsed = parseDob(req.body?.dob);
     const currentLocation = String(req.body?.currentLocation || "").trim();
 
-    // Validate full name.
+    // Validate required fields
     if (!fullName) {
       return res.status(400).json({ success: false, message: "Full name is required" });
     }
 
-    // Validate phone number.
     if (!phone || !isValidPhone(phone)) {
       return res.status(400).json({ success: false, message: "Valid 10-digit phone is required" });
     }
 
-    // Validate email address.
-    const effectiveEmail = email || tokenEmail;
-    if (!effectiveEmail || !isValidEmail(effectiveEmail)) {
+    if (!email || !isValidEmail(email)) {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
-    if (effectiveEmail !== tokenEmail) {
-      return res.status(400).json({
-        success: false,
-        message: "Email must match the verified login email",
-      });
+    if (email !== tokenEmail) {
+      return res.status(400).json({ success: false, message: "Email must match the verified login email" });
     }
 
-    // Validate gender.
     if (!gender || !["Male", "Female", "Other"].includes(gender)) {
       return res.status(400).json({ success: false, message: "Valid gender is required" });
     }
 
-    // Validate date of birth.
     if (!dobParsed) {
       return res.status(400).json({ success: false, message: "Valid date of birth is required" });
     }
@@ -113,32 +98,46 @@ export async function registerPatient(req, res, next) {
       return res.status(400).json({ success: false, message: "Date of birth cannot be in the future" });
     }
 
-    // Validate current location.
     if (!currentLocation) {
       return res.status(400).json({ success: false, message: "Current location is required" });
     }
 
-    // Check for existing phone number.
-    const existingPhone = await Patient.findOne({ phone, userId: { $ne: userId } });
+    // Check for existing phone number
+    const existingPhone = await Patient.findOne({ phone });
     if (existingPhone) {
       return res.status(409).json({ success: false, message: "Phone number already in use" });
     }
 
-    // Upsert patient profile keyed by userId.
-    const patient = await Patient.findOneAndUpdate(
-      { userId },
-      {
-        $set: {
-          fullName,
-          phone,
-          email: tokenEmail,
-          dob: dobParsed,
-          gender,
-          currentLocation,
-        },
-      },
-      { upsert: true, new: true }
-    );
+    // Check for existing email
+    const existingEmail = await Patient.findOne({ email });
+    if (existingEmail) {
+      return res.status(409).json({ success: false, message: "Email already registered" });
+    }
+
+    console.log('[registerPatient] Creating new patient for email:', email);
+
+    // Create or find User record first
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({
+        email,
+        createdAt: new Date(),
+      });
+      console.log('[registerPatient] Created new user:', user._id.toString());
+    }
+
+    // Create patient profile
+    const patient = await Patient.create({
+      userId: user._id,
+      fullName,
+      phone,
+      email,
+      dob: dobParsed,
+      gender,
+      currentLocation,
+    });
+
+    console.log('[registerPatient] Patient created successfully:', patient._id.toString());
 
     return res.status(200).json({
       success: true,
